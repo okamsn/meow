@@ -351,6 +351,7 @@ Highlights are only visible in the selected window."
         (cancel-timer timer)
         (delete-overlays)))))
 
+
 (defun meow--on-window-state-change (&rest _args)
   "Update cursor style after switching window."
   (meow--update-cursor)

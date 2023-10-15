@@ -1343,6 +1343,95 @@ Argument REVERSE if selection is reversed."
       (or (funcall func text nil t 1)
           (funcall func-2 text nil t 1)))))
 
+(defcustom meow-visiter #'meow-visiter-isearch
+  "Visiter used for `meow-visit'."
+  :group 'meow
+  :type '(choice (const :tag "Minibuffer completion (default)" meow-visiter-default)
+                 (const :tag "Isearch" meow-visiter-isearch)
+                 function))
+
+(defvar-local meow--visiting nil
+  "Whether `meow-visit' is currently executing.")
+
+(defvar isearch-match-data)
+
+(defun meow--visit-isearch-sanitize (str &optional _)
+  "Return a sanitized version of STR.
+
+The second argument is ignored.  For other Isearch regexp
+functions, such as `isearch-symbol-regexp', it determines whether
+the regexp must match a symbol boundary.  To match the default
+visiting behavior using the minibuffer, we always match symbol
+boundaries.
+
+This is a separate function to avoid problems with
+`isearch--describe-regexp-mode'."
+  ;; The below regexp was made using the below call to
+  ;; `rx', which has gained features since Emacs 26.3.
+  ;;
+  ;;(rx (or (seq symbol-start (literal str) symbol-end))
+  ;;        (seq word-start (literal str) word-end))
+  (let ((qtd (regexp-quote str)))
+    (concat "\\_<\\(?:" qtd "\\)\\_>\\|\\<\\(?:" qtd "\\)\\>")))
+
+(put 'meow--visit-isearch-sanitize 'isearch-message-prefix "sanitized ")
+
+(defun meow--visit-isearch-unsanitize (str &optional _)
+  "Return STR.
+
+This is the unsanitized version of `meow--visit-isearch-sanitize'.
+
+This is a separate function to avoid problems with
+`isearch--describe-regexp-mode'."
+  str)
+
+(put 'meow--visit-isearch-sanitize 'isearch-message-prefix "unsanitized ")
+
+(cl-defun meow-visiter-isearch (prompt reverse sanitize &key &allow-other-keys)
+  "Get the visited region using Isearch.
+
+- PROMPT is the prompt to display for completion.
+- REVERSE is whether `meow-visit' is going forwards or backwards.
+- SANITIZE is whether only full words and symbols should be
+  literally matched, as in `meow-visit-sanitize-completion'."
+  (ignore prompt)
+  (let ((text)
+        (regexp)
+        (beg)
+        (end)
+        (fn (if sanitize
+                #'meow--visit-isearch-sanitize
+              #'meow--visit-isearch-unsanitize)))
+    (cl-labels ((get-data ()
+                  (if isearch-mode-end-hook-quit
+                      ;; TODO: Is this the right way to quit?
+                      (keyboard-quit)
+                    (when isearch-success
+                      (setq text isearch-string
+                            beg (cl-first isearch-match-data)
+                            end (cl-second isearch-match-data)
+                            regexp (funcall fn isearch-string))))))
+      (unwind-protect
+          (progn
+            (add-hook 'isearch-mode-end-hook #'get-data nil 'local)
+            (isearch-mode (null reverse) t nil t fn))
+        (remove-hook 'isearch-mode-end-hook #'get-data 'local)))
+    (list text regexp beg end)))
+
+(cl-defun meow-visiter-default (prompt reverse sanitize &key &allow-other-keys)
+  "Get the visited region using the minibuffer.
+
+- PROMPT is the prompt to display for completion.
+- REVERSE is whether `meow-visit' is going forwards or backwards.
+- SANITIZE is whether completions should be sanitized,
+  as in `meow-visit-sanitize-completion'."
+  (let* ((meow-visit-sanitize-completion sanitize)
+         (text (meow--prompt-symbol-and-words prompt (point-min) (point-max)))
+         (visit-point (meow--visit-point text reverse)))
+    (if visit-point
+        (list text text (match-beginning 0) (match-end 0))
+      (list text nil nil nil))))
+
 (defun meow-visit (arg)
   "Read a string from minibuffer, then find and select it.
 
@@ -1367,42 +1456,29 @@ start or end of the selection are highlighted, depending on whether
 
 To search backward, use \\[negative-argument]."
   (interactive "P")
-  (let* ((reverse arg)
-         (pos (point))
+  (let* ((visiter meow-visiter)
+         (reverse arg)
          (prompt (if reverse "Visit backward: " "Visit: "))
-         (text (pcase meow-visit-prompter
-                 ('buffer-highlight
-                  (apply #'meow--prompt-buffer-highlight
-                         prompt
-                         (let* ((ov-start (overlay-start mouse-secondary-overlay))
-                                (ov-end (overlay-end mouse-secondary-overlay))
-                                (use-sec (and (meow-beacon-mode-p)
-                                              (secondary-selection-exist-p)
-                                              (>= pos ov-start)
-                                              (< pos ov-end))))
-                           (if reverse
-                               (list (window-start (selected-window))
-                                     (if use-sec ov-end pos))
-                             (list (if use-sec ov-start pos)
-                                   (window-end (selected-window)))))))
-                 ((or 'completion _)
-                  (meow--prompt-symbol-and-words prompt
-                                                 (point-min) (point-max)))))
-         (visit-point (meow--visit-point text reverse)))
-    (if visit-point
-        (let* ((m (match-data))
-               (marker-beg (car m))
-               (marker-end (cadr m))
-               (beg (if (> pos visit-point) (marker-position marker-end) (marker-position marker-beg)))
-               (end (if (> pos visit-point) (marker-position marker-beg) (marker-position marker-end))))
-          (thread-first
-            (meow--make-selection '(select . visit) beg end)
-            (meow--select))
-          (meow--push-search text)
-          (meow--ensure-visible)
-          (meow--highlight-regexp-in-buffer text)
-          (setq meow--dont-remove-overlay t))
-      (message "Visit: %s failed" text))))
+         (buffer (current-buffer))
+         (window (selected-window))
+         (meow--visiting t))
+    (unless (fboundp visiter)
+      (message "`meow-visit': Using default instead of unrecognized function in `meow-visiter': %s"
+               visiter)
+      (setq visiter #'meow-visiter-default))
+
+    (pcase-let (((and whole `(,text ,regexp ,beg ,end))
+                 (funcall visiter prompt reverse meow-visit-sanitize-completion
+                          :buffer buffer :window window)))
+      (if (cl-some #'null whole)
+          (message "Visit failed: %s" text)
+        (thread-first
+          (meow--make-selection '(select . visit) beg end)
+          (meow--select))
+        (meow--push-search regexp)
+        (meow--ensure-visible)
+        (meow--highlight-regexp-in-buffer regexp)
+        (setq meow--dont-remove-overlay t)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; THING
